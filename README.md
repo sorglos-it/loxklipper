@@ -17,7 +17,8 @@ Nothing about it is tied to the printer: it is a plain HTTP call to the Miniserv
 - **Assembles the URL for you** — IP, Virtual Text Input name and text go in as separate options; no hand-built URLs to get wrong
 - **Basic authentication** — user and password are base64-encoded into the `Authorization` header, done once at startup
 - **Non-blocking** — the HTTP call runs in a worker thread while Klipper's reactor keeps servicing the MCU
-- **Delayed sending** — `wait_time` fires the request N seconds *after* the G-code call, by default without holding up the print; overridable per call with `WAIT=`
+- **Temperature guard** — `nozzle: 60` holds the request back until the hotend has cooled below 60 °C; `bed:` does the same for the bed
+- **Delayed sending** — `wait_time` fires the request N seconds *after* the guard opens, by default without holding up the print; overridable per call with `WAIT=`
 - **Override per call** — `VALUE=` sends a different text through the same target, so on and off need one section, not two
 - **Chooses how to fail** — `on_error: log` (default), `pause` the print, or `abort` it
 - **Retries** — `retries: N` re-sends after a network hiccup
@@ -54,6 +55,15 @@ Authorization: Basic <base64 of user:password>
 ```
 
 so the example project answers to `http://192.168.1.10/dev/sps/io/api/sw1`, which in `printer.cfg` is `vi_name: api` and `text_send: sw1`.
+
+## Order of a call
+
+```
+LOXONE NAME=…  →  temperature guard  →  wait_time  →  HTTP POST
+                  (nozzle / bed)        (seconds)
+```
+
+Both stages are optional. With neither configured the request goes out immediately and the console reports the result straight away.
 
 Two things about this wiring are worth knowing before you copy it:
 
@@ -106,7 +116,9 @@ wait_time: 0
 | `password` | *required* | That user's password, in plain text — read the caveats. Alias: `passwort` |
 | `vi_name` | *required* | Name of the Virtual Text Input in Loxone Config. Alias: `viName` |
 | `text_send` | *required* | Text pushed into that input; must match what the **Pulse At** block behind it expects. Alias: `textSend` |
-| `wait_time` | `0` | Seconds to wait **before** the request is sent. `0` sends at once. Alias: `waittime` |
+| `nozzle` | *off* | Hold the request until the extruder is **below** this temperature in °C. Alias: `nozzel` |
+| `bed` | *off* | Same for `heater_bed` |
+| `wait_time` | `0` | Seconds to wait **before** the request is sent, counted from when the temperature guard opens. `0` sends as soon as the guard is clear. Alias: `waittime` |
 | `wait_mode` | `defer` | `defer` lets the print continue during the wait; `block` holds the G-code stream until the request has gone out |
 | `protocol` | `http` | `http` or `https` |
 | `verify_certificate` | `True` | HTTPS only. `False` skips certificate checking for a self-signed Miniserver certificate |
@@ -204,9 +216,35 @@ With a `wait_time` in the default `defer` mode the command returns straight away
 
 Failures land in `_handle_failure`, which logs to `klippy.log`, echoes to the console with a `!!` prefix, and then does whatever `on_error` says.
 
+## Temperature guard
+
+`nozzle: 60` holds a call back until the hotend has cooled below 60 °C — useful when the thing being switched should not happen while the printer is still hot, for instance cutting power to the printer's socket or shutting down an enclosure fan.
+
+```ini
+[loxone printer_socket]
+loxone_ip: 192.168.1.10
+user: klipper
+password: changeme
+vi_name: api
+text_send: socket_off
+nozzle: 60          # only once the hotend is below 60 °C
+bed: 50             # and the bed below 50 °C
+wait_time: 30       # then wait another 30 s, then send
+```
+
+The guard runs **before** `wait_time`, so the 30 s above start counting the moment the printer is cool enough, not when the G-code line was reached. Every configured limit has to be satisfied at once.
+
+Two properties worth knowing, both deliberate:
+
+- **The guard has no timeout.** If the printer never cools below the limit — because a next print reheats it — the call simply never goes out. For a safety guard that is the right failure direction. `LOXONE_LIST` shows what is still held, `LOXONE_CANCEL` clears it. In `wait_mode: block` the same situation holds the G-code stream indefinitely, exactly as Klipper's own `TEMPERATURE_WAIT` does.
+- **A stale sensor does not count as cold.** Klipper's `get_temp()` returns `0.0` when the last reading is more than about five seconds old, which for a guard is the dangerous direction — a hung sensor would look like a cold nozzle. The guard therefore requires three consecutive readings below the limit before it opens, so a single stale `0.0` cannot release it. Anything it cannot read at all (missing heater, exception) counts as too hot.
+
+A heater name that does not exist is a **startup error**, not a warning. The guard fails safe by never opening, and a silent never-switching call is far harder to notice than a printer that refuses to start.
+
 ## Notes & caveats
 
 - **Your Loxone password sits in `printer.cfg` in plain text.** Mainsail and Fluidd show that file in their config editor, Moonraker serves it over the network, and it ends up in every config backup and in `git` if you version your config. Base64 is encoding, not encryption — anyone who reads the file has the password. Create a **dedicated Loxone user** with only the rights this needs, and do not reuse an admin password.
+- **The temperature guard is not a substitute for Klipper's own thermal protection.** It decides when an HTTP request goes out, nothing more. It does not turn heaters off, does not monitor for thermal runaway, and cannot stop anything on the printer. If you use it to cut mains power to the printer, that power switch is outside Klipper's control entirely — think through what happens if the request is delayed, lost, or fires while a second print has already started.
 - **`wait_time` delays the request, it does not run after it.** `LOXONE NAME=tv` with `wait_time: 120` returns immediately, the print carries on, and the POST goes out two minutes later. The console says `scheduled in 120s` at the call and reports the HTTP result when it actually fires, so two messages per call is normal.
 - **`wait_mode: block` does stop the toolhead with a hot nozzle.** In that mode the wait holds the G-code stream, the move queue drains, and the printer sits still for the duration — a `wait_mode: block` with `wait_time: 120` mid-print will leave a blob or a burnt patch. That is why `defer` is the default. If you do want `block` mid-print, park and retract first; `docs/example-printer.cfg` has a macro that does.
 - **The delay is counted from when the line is parsed, not from when the toolhead gets there.** Klipper reads ahead of the motion queue, so a `LOXONE` call in the middle of a print starts its countdown slightly before the nozzle reaches the matching point in the model. For "switch the light on at layer 30" that is irrelevant; for anything that must be frame-accurate it is not.

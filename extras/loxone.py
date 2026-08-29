@@ -27,6 +27,13 @@ WAIT_SLICE = 1.0
 POLL_SLICE = 0.05
 # Pause between retries, inside the worker thread.
 RETRY_DELAY = 1.0
+# How often the temperature guard re-reads the heaters.
+TEMP_POLL = 1.0
+# Consecutive readings below the limit before the guard opens. Klipper's
+# Heater.get_temp() reports 0.0 when the last sample is more than ~5s old,
+# and for a safety guard a stale sensor must not look like a cold nozzle.
+# Requiring several readings in a row makes a single stale 0.0 harmless.
+TEMP_CONFIRM = 3
 
 
 def _read_option(config, getter_name, names, **kwargs):
@@ -42,6 +49,17 @@ def _read_option(config, getter_name, names, **kwargs):
     # Falling back to names[0] gives the canonical option its normal
     # default, or its normal "missing option" error message.
     return getter(names[0] if found is None else found, **kwargs)
+
+
+class _Pending:
+    # One deferred call. It first has to get past the temperature guard
+    # (armed=False), and only then does its wait_time start counting.
+    def __init__(self, value, wait_time):
+        self.value = value
+        self.wait_time = wait_time
+        self.waketime = 0.
+        self.armed = False
+        self.confirms = 0
 
 
 class _Result:
@@ -91,6 +109,17 @@ class LoxoneTarget:
         self.on_error = config.getchoice(
             'on_error', {'log': 'log', 'pause': 'pause', 'abort': 'abort'},
             'log')
+        # Temperature guard. The request is held back until every configured
+        # heater has cooled below its limit; wait_time only starts after that.
+        self.temp_limits = []
+        nozzle = _read_option(config, 'getfloat', ['nozzle', 'nozzel'],
+                              default=None, minval=0.)
+        if nozzle is not None:
+            self.temp_limits.append(('extruder', nozzle))
+        bed = config.getfloat('bed', None, minval=0.)
+        if bed is not None:
+            self.temp_limits.append(('heater_bed', bed))
+        self._heaters = {}
         # Precomputed so the password is turned into a header exactly once
         # and never rebuilt (or logged) per call.
         token = base64.b64encode(
@@ -103,6 +132,12 @@ class LoxoneTarget:
         self.inflight = []
         self.send_timer = self.reactor.register_timer(self._send_timer)
         self.poll_timer = self.reactor.register_timer(self._poll_timer)
+        # Heaters are looked up at ready, not here: [loxone ...] may well be
+        # parsed before [extruder]. Failing at ready turns a typo into a
+        # startup error instead of a guard that silently never opens.
+        if self.temp_limits:
+            self.printer.register_event_handler("klippy:ready",
+                                                self._handle_ready)
         dispatch = self.printer.lookup_object('loxone_dispatch', None)
         if dispatch is None:
             dispatch = LoxoneDispatch(self.printer)
@@ -120,7 +155,8 @@ class LoxoneTarget:
     def get_status(self, eventtime=None):
         return {'name': self.name, 'url': self.build_url(self.text_send),
                 'method': self.method, 'wait_time': self.wait_time,
-                'wait_mode': self.wait_mode, 'pending': len(self.pending)}
+                'wait_mode': self.wait_mode, 'pending': len(self.pending),
+                'temp_limits': dict(self.temp_limits)}
 
     def _respond(self, msg, gcmd=None):
         # A deferred send has no G-code command left to answer to, so the
@@ -129,6 +165,74 @@ class LoxoneTarget:
             gcmd.respond_info(msg)
         else:
             self.gcode.respond_info(msg)
+
+    # ------------------------------------------------- temperature guard
+
+    def _handle_ready(self):
+        # Resolve the heaters now so a wrong name is a startup error. The
+        # guard fails safe (it simply never opens), which would otherwise be
+        # invisible until the call quietly failed to happen.
+        pheaters = self.printer.lookup_object('heaters', None)
+        if pheaters is None:
+            raise self.printer.config_error(
+                "loxone %s: a temperature guard is configured but this "
+                "printer has no heaters" % (self.name,))
+        for heater_name, limit in self.temp_limits:
+            # lookup_heater raises a config error naming the unknown heater
+            self._heaters[heater_name] = pheaters.lookup_heater(heater_name)
+
+    def _heater(self, name):
+        heater = self._heaters.get(name)
+        if heater is None:
+            pheaters = self.printer.lookup_object('heaters', None)
+            if pheaters is not None:
+                try:
+                    heater = pheaters.lookup_heater(name)
+                    self._heaters[name] = heater
+                except Exception:
+                    heater = None
+        return heater
+
+    def _temp_blocker(self, eventtime):
+        # Returns None when every heater is below its limit, otherwise a
+        # short reason for the console. Anything unreadable counts as "too
+        # hot" so the guard errs towards not sending.
+        for heater_name, limit in self.temp_limits:
+            heater = self._heater(heater_name)
+            if heater is None:
+                return "%s not available" % (heater_name,)
+            try:
+                temp = heater.get_temp(eventtime)[0]
+            except Exception as e:
+                return "%s unreadable (%s)" % (heater_name, type(e).__name__)
+            if temp >= limit:
+                return "%s %.1fC >= %.0fC" % (heater_name, temp, limit)
+        return None
+
+    def _guard_blocking(self, gcmd):
+        confirms = 0
+        eventtime = self.reactor.monotonic()
+        told = False
+        while confirms < TEMP_CONFIRM:
+            if self.printer.is_shutdown():
+                raise gcmd.error(
+                    "loxone %s: temperature guard aborted, printer shut down"
+                    % (self.name,))
+            blocker = self._temp_blocker(eventtime)
+            if blocker is None:
+                confirms += 1
+            else:
+                confirms = 0
+                if not told:
+                    self._respond("loxone %s: waiting for %s"
+                                  % (self.name, blocker), gcmd)
+                    told = True
+            if confirms >= TEMP_CONFIRM:
+                break
+            eventtime = self.reactor.pause(eventtime + TEMP_POLL)
+        if told:
+            self._respond("loxone %s: temperature reached" % (self.name,),
+                          gcmd)
 
     # ---------------------------------------------------------------- HTTP
 
@@ -246,30 +350,75 @@ class LoxoneTarget:
     # ------------------------------------------------ send, deferred path
 
     def _schedule(self, value, delay, gcmd):
-        waketime = self.reactor.monotonic() + delay
-        self.pending.append((waketime, value))
-        self.pending.sort(key=lambda item: item[0])
-        self.reactor.update_timer(self.send_timer, self.pending[0][0])
-        self._respond("loxone %s: %s scheduled in %.0fs"
-                      % (self.name, value, delay), gcmd)
+        entry = _Pending(value, delay)
+        now = self.reactor.monotonic()
+        if self.temp_limits:
+            # The guard runs first; wait_time only starts once it opens.
+            entry.waketime = now
+            blocker = self._temp_blocker(now)
+            if blocker is None:
+                self._respond("loxone %s: %s waiting for temperature check"
+                              % (self.name, value), gcmd)
+            else:
+                self._respond("loxone %s: %s held back, waiting for %s"
+                              % (self.name, value, blocker), gcmd)
+        else:
+            entry.armed = True
+            entry.waketime = now + delay
+            self._respond("loxone %s: %s scheduled in %.0fs"
+                          % (self.name, value, delay), gcmd)
+        self.pending.append(entry)
+        self._rearm()
+
+    def _rearm(self):
+        if not self.pending:
+            self.reactor.update_timer(self.send_timer, self.reactor.NEVER)
+            return
+        self.reactor.update_timer(self.send_timer,
+                                  min(p.waketime for p in self.pending))
 
     def _send_timer(self, eventtime):
         if self.printer.is_shutdown():
             self.pending = []
             return self.reactor.NEVER
-        due = [v for wt, v in self.pending if wt <= eventtime]
-        self.pending = [(wt, v) for wt, v in self.pending if wt > eventtime]
-        for value in due:
-            url = self.build_url(value)
+        still = []
+        for entry in self.pending:
+            if entry.waketime > eventtime:
+                still.append(entry)
+                continue
+            if not entry.armed:
+                blocker = self._temp_blocker(eventtime)
+                if blocker is not None:
+                    entry.confirms = 0
+                    entry.waketime = eventtime + TEMP_POLL
+                    still.append(entry)
+                    continue
+                entry.confirms += 1
+                if entry.confirms < TEMP_CONFIRM:
+                    entry.waketime = eventtime + TEMP_POLL
+                    still.append(entry)
+                    continue
+                entry.armed = True
+                if entry.wait_time > 0.:
+                    entry.waketime = eventtime + entry.wait_time
+                    self._respond(
+                        "loxone %s: temperature reached, %s sends in %.0fs"
+                        % (self.name, entry.value, entry.wait_time))
+                    still.append(entry)
+                    continue
+                self._respond("loxone %s: temperature reached"
+                              % (self.name,))
+            url = self.build_url(entry.value)
             result = _Result()
             self._start_worker(url, result)
-            self.inflight.append((result, url, value))
+            self.inflight.append((result, url, entry.value))
+        self.pending = still
         if self.inflight:
             self.reactor.update_timer(self.poll_timer,
                                       self.reactor.monotonic() + POLL_SLICE)
         if not self.pending:
             return self.reactor.NEVER
-        return self.pending[0][0]
+        return min(p.waketime for p in self.pending)
 
     def _poll_timer(self, eventtime):
         still = []
@@ -289,18 +438,22 @@ class LoxoneTarget:
     def cancel(self):
         count = len(self.pending)
         self.pending = []
-        self.reactor.update_timer(self.send_timer, self.reactor.NEVER)
+        self._rearm()
         return count
 
     def fire(self, gcmd, value=None, wait_time=None):
         value = self.text_send if value is None else value
         wait_time = self.wait_time if wait_time is None else wait_time
-        # wait_time delays the request. Without one there is nothing to
-        # schedule, so the call goes out now and answers in the console.
-        if wait_time <= 0.:
+        # Order is: temperature guard, then wait_time, then send. With
+        # neither of the two there is nothing to schedule, so the call goes
+        # out now and answers in the console.
+        if not self.temp_limits and wait_time <= 0.:
             self._send_blocking(value, gcmd)
         elif self.wait_mode == 'block':
-            self._wait_blocking(wait_time, gcmd)
+            if self.temp_limits:
+                self._guard_blocking(gcmd)
+            if wait_time > 0.:
+                self._wait_blocking(wait_time, gcmd)
             self._send_blocking(value, gcmd)
         else:
             self._schedule(value, wait_time, gcmd)
@@ -355,13 +508,21 @@ class LoxoneDispatch:
         lines = ["Configured Loxone targets:"]
         for key in sorted(self.targets):
             t = self.targets[key]
-            wait = "no wait"
+            bits = []
+            if t.temp_limits:
+                bits.append("guard " + ", ".join(
+                    "%s<%.0fC" % (n, lim) for n, lim in t.temp_limits))
             if t.wait_time > 0.:
-                wait = "wait %.0fs then send (%s)" % (t.wait_time, t.wait_mode)
-            pending = (", %d pending" % (len(t.pending),)) if t.pending else ""
-            lines.append("  %s: %s %s [%s%s]"
+                bits.append("wait %.0fs" % (t.wait_time,))
+            bits.append(t.wait_mode if bits else "sends at once")
+            if t.pending:
+                held = sum(1 for p in t.pending if not p.armed)
+                bits.append("%d pending%s"
+                            % (len(t.pending),
+                               (", %d held by guard" % (held,)) if held else ""))
+            lines.append("  %s: %s %s [%s]"
                          % (t.name, t.method, t.build_url(t.text_send),
-                            wait, pending))
+                            "; ".join(bits)))
         gcmd.respond_info("\n".join(lines))
 
     cmd_LOXONE_CANCEL_help = ("Drop scheduled Loxone calls that have not been "
