@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://www.paypal.com/donate/?hosted_button_id=6CDEVZGJWTNQQ)
 
-A Klipper extras module that lets a 3D printer switch things in a **Loxone** home automation system straight from G-code. Define one `[loxone ...]` block per thing you want to switch, then put `LOXONE NAME=<target>` in a macro or in your slicer's start/end G-code. The module assembles the Miniserver URL, sends the request with HTTP Basic authentication, reports the reply in the console and optionally waits a configured number of seconds before the next G-code line runs.
+A Klipper extras module that lets a 3D printer switch things in a **Loxone** home automation system straight from G-code. Define one `[loxone ...]` block per thing you want to switch, then put `LOXONE NAME=<target>` in a macro or in your slicer's start/end G-code. The module assembles the Miniserver URL, sends the request with HTTP Basic authentication, reports the reply in the console. A `wait_time` delays the request by a configured number of seconds, so `LOXONE NAME=tv` in your start G-code can switch something on two minutes into the print rather than at once.
 
 Nothing about it is tied to the printer: it is a plain HTTP call to the Miniserver's web service, so anything you can wire behind a Virtual Text Input in Loxone Config is fair game — lights, a TV, an extractor fan, a notification. The request runs in a worker thread so it never stalls Klipper's event loop, and a Miniserver that is switched off or unreachable does not abort your print unless you ask it to.
 
@@ -17,7 +17,7 @@ Nothing about it is tied to the printer: it is a plain HTTP call to the Miniserv
 - **Assembles the URL for you** — IP, Virtual Text Input name and text go in as separate options; no hand-built URLs to get wrong
 - **Basic authentication** — user and password are base64-encoded into the `Authorization` header, done once at startup
 - **Non-blocking** — the HTTP call runs in a worker thread while Klipper's reactor keeps servicing the MCU
-- **Optional wait** — `wait_time` holds the G-code stream for N seconds after the call, overridable per call with `WAIT=`
+- **Delayed sending** — `wait_time` fires the request N seconds *after* the G-code call, by default without holding up the print; overridable per call with `WAIT=`
 - **Override per call** — `VALUE=` sends a different text through the same target, so on and off need one section, not two
 - **Chooses how to fail** — `on_error: log` (default), `pause` the print, or `abort` it
 - **Retries** — `retries: N` re-sends after a network hiccup
@@ -106,7 +106,8 @@ wait_time: 0
 | `password` | *required* | That user's password, in plain text — read the caveats. Alias: `passwort` |
 | `vi_name` | *required* | Name of the Virtual Text Input in Loxone Config. Alias: `viName` |
 | `text_send` | *required* | Text pushed into that input; must match what the **Pulse At** block behind it expects. Alias: `textSend` |
-| `wait_time` | `0` | Seconds to hold the G-code stream **after** the call. Alias: `waittime` |
+| `wait_time` | `0` | Seconds to wait **before** the request is sent. `0` sends at once. Alias: `waittime` |
+| `wait_mode` | `defer` | `defer` lets the print continue during the wait; `block` holds the G-code stream until the request has gone out |
 | `protocol` | `http` | `http` or `https` |
 | `verify_certificate` | `True` | HTTPS only. `False` skips certificate checking for a self-signed Miniserver certificate |
 | `method` | `POST` | HTTP method |
@@ -122,9 +123,10 @@ Option names are case-insensitive and the camelCase spellings above are accepted
 
 | Command | Effect |
 |---|---|
-| `LOXONE NAME=<target>` | Send that target's configured text, then wait its `wait_time` |
+| `LOXONE NAME=<target>` | Wait the target's `wait_time`, then send its configured text |
 | `LOXONE NAME=<target> VALUE=<text>` | Send a different text through the same target |
-| `LOXONE NAME=<target> WAIT=<seconds>` | Override `wait_time` for this call; `WAIT=0` skips it |
+| `LOXONE NAME=<target> WAIT=<seconds>` | Override `wait_time` for this call; `WAIT=0` sends at once |
+| `LOXONE_CANCEL [NAME=<target>]` | Drop scheduled calls that have not been sent yet |
 | `LOXONE_LIST` | List the configured targets with the URL each one would call |
 
 In a macro:
@@ -196,16 +198,21 @@ curl -s localhost:7125/machine/update/status | python3 -m json.tool | grep -i lo
 
 `[loxone <name>]` is a Klipper config prefix, so each section builds one `LoxoneTarget`. The first one created also registers the shared `LOXONE` and `LOXONE_LIST` commands and puts a dispatcher on the printer object; every later section registers itself with that dispatcher. This is why ten targets still give you one command rather than ten.
 
-When `LOXONE` runs, the target percent-encodes `vi_name` and the text into the path, hands the request to a worker thread, and then polls that thread through `reactor.pause()` in 50 ms slices. That detail is the whole point of the design: a blocking socket call in Klipper's main thread stops MCU communication for the length of the timeout and can end in a `Timer too close` shutdown mid-print. The same `reactor.pause()` loop implements `wait_time`, in one-second slices, and breaks out if the printer shuts down underneath it.
+When `LOXONE` runs with no wait, the target percent-encodes `vi_name` and the text into the path, hands the request to a worker thread, and polls that thread through `reactor.pause()` in 50 ms slices. That detail is the whole point of the design: a blocking socket call in Klipper's main thread stops MCU communication for the length of the timeout and can end in a `Timer too close` shutdown mid-print.
+
+With a `wait_time` in the default `defer` mode the command returns straight away and the send is put on a Klipper reactor timer. Two long-lived timers per target drive it — one to fire due calls, one to collect finished requests — re-armed with `update_timer` rather than registered per call, so a print with hundreds of `LOXONE` calls does not leave hundreds of dead timers behind. `wait_mode: block` instead holds the G-code stream in a `reactor.pause()` loop, in one-second slices, breaking out if the printer shuts down underneath it.
 
 Failures land in `_handle_failure`, which logs to `klippy.log`, echoes to the console with a `!!` prefix, and then does whatever `on_error` says.
 
 ## Notes & caveats
 
 - **Your Loxone password sits in `printer.cfg` in plain text.** Mainsail and Fluidd show that file in their config editor, Moonraker serves it over the network, and it ends up in every config backup and in `git` if you version your config. Base64 is encoding, not encryption — anyone who reads the file has the password. Create a **dedicated Loxone user** with only the rights this needs, and do not reuse an admin password.
-- **`wait_time` stops the toolhead with a hot nozzle.** The wait blocks the G-code stream, so the move queue drains and the printer sits still for the duration. A `wait_time: 120` in the middle of a print will leave a blob or a burnt patch. Use it in start/end G-code, keep it short mid-print, or park and retract first — `docs/example-printer.cfg` has a macro that does. `WAIT=0` skips the wait for a single call.
-- **The wait happens when the line is parsed, not when the toolhead gets there.** Klipper reads ahead of the motion queue, so a `LOXONE` call in the middle of a print fires slightly before the nozzle reaches the matching point in the model. For "switch the light on at layer 30" that is irrelevant; for anything that must be frame-accurate it is not.
-- **`M112` still works during a wait, `CANCEL_PRINT` queues behind it.** Emergency stop is handled out of band and breaks the wait loop through the shutdown check. A normal cancel is an ordinary G-code command and waits its turn, so it takes effect after the wait expires.
+- **`wait_time` delays the request, it does not run after it.** `LOXONE NAME=tv` with `wait_time: 120` returns immediately, the print carries on, and the POST goes out two minutes later. The console says `scheduled in 120s` at the call and reports the HTTP result when it actually fires, so two messages per call is normal.
+- **`wait_mode: block` does stop the toolhead with a hot nozzle.** In that mode the wait holds the G-code stream, the move queue drains, and the printer sits still for the duration — a `wait_mode: block` with `wait_time: 120` mid-print will leave a blob or a burnt patch. That is why `defer` is the default. If you do want `block` mid-print, park and retract first; `docs/example-printer.cfg` has a macro that does.
+- **The delay is counted from when the line is parsed, not from when the toolhead gets there.** Klipper reads ahead of the motion queue, so a `LOXONE` call in the middle of a print starts its countdown slightly before the nozzle reaches the matching point in the model. For "switch the light on at layer 30" that is irrelevant; for anything that must be frame-accurate it is not.
+- **A scheduled call survives the end of the print, but not a restart.** It is held on a Klipper reactor timer, so it still fires after the print finishes — which is usually the point. A `FIRMWARE_RESTART`, an emergency stop or a Klipper restart drops everything still pending, silently. `LOXONE_LIST` shows what is queued; `LOXONE_CANCEL` clears it deliberately.
+- **In `block` mode, `M112` still works during the wait but `CANCEL_PRINT` queues behind it.** Emergency stop is handled out of band and breaks the wait loop through the shutdown check. A normal cancel is an ordinary G-code command and waits its turn, so it only takes effect once the wait expires. In the default `defer` mode neither is blocked, because the G-code stream was never held.
+- **`on_error: abort` cannot abort a deferred call.** By the time a scheduled request fails, the G-code command that started it has long finished, so there is nothing left to raise into. It falls back to `pause` there. In `block` mode and with `wait_time: 0` it aborts as documented.
 - **POST is the default because it was asked for; Loxone documents these endpoints as GET.** POST works against current firmware. If your Miniserver answers `405 Method Not Allowed`, set `method: GET` — nothing else changes.
 - **`on_error: log` means a dead Miniserver does not stop your print.** That is the default on purpose. If the switching matters more than the print, use `abort`; `pause` needs `[pause_resume]` configured, and says so in the console instead of failing silently if it is missing.
 - **`verify_certificate: False` turns off TLS verification completely** for that target — not just the hostname check. It is the right setting for a Miniserver with a self-signed certificate on your own LAN and the wrong one over the open internet.

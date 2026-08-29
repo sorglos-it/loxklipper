@@ -39,7 +39,9 @@ def pick(section, key, default=None):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Send one Loxone command from a Klipper config section.")
+        description="Send one Loxone command from a Klipper config section. "
+                    "wait_time is ignored here - this sends straight away, "
+                    "because the point is to check the URL and credentials.")
     ap.add_argument('config', help="printer.cfg (or any file holding the "
                                    "[loxone ...] sections)")
     ap.add_argument('name', nargs='?',
