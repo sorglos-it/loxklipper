@@ -244,7 +244,17 @@ A heater name that does not exist is a **startup error**, not a warning. The gua
 ## Notes & caveats
 
 - **Your Loxone password sits in `printer.cfg` in plain text.** Mainsail and Fluidd show that file in their config editor, Moonraker serves it over the network, and it ends up in every config backup and in `git` if you version your config. Base64 is encoding, not encryption — anyone who reads the file has the password. Create a **dedicated Loxone user** with only the rights this needs, and do not reuse an admin password.
-- **The temperature guard is not a substitute for Klipper's own thermal protection.** It decides when an HTTP request goes out, nothing more. It does not turn heaters off, does not monitor for thermal runaway, and cannot stop anything on the printer. If you use it to cut mains power to the printer, that power switch is outside Klipper's control entirely — think through what happens if the request is delayed, lost, or fires while a second print has already started.
+- **Put `LOXONE_CANCEL` at the top of `PRINT_START`.** A `socket_off` left over from the previous print may still be counting down its `wait_time`, and it does not care that a new print has begun. One line clears it:
+
+```ini
+[gcode_macro PRINT_START]
+gcode:
+    LOXONE_CANCEL
+    # ... homing, heating, your usual start ...
+```
+
+- **The guard is checked once, when it opens — not again at send time.** Once the printer has been cool enough and `wait_time` is counting, re-heating does not put the call back on hold. `LOXONE_CANCEL` in `PRINT_START` covers the normal case; a manual preheat that does not run `PRINT_START` is the one it does not.
+- **The temperature guard is not a substitute for Klipper's own thermal protection.** It decides when an HTTP request goes out, nothing more. It does not turn heaters off, does not monitor for thermal runaway, and cannot stop anything on the printer. If you use it to cut mains power to the printer, that switch is outside Klipper's control entirely.
 - **`wait_time` delays the request, it does not run after it.** `LOXONE NAME=tv` with `wait_time: 120` returns immediately, the print carries on, and the POST goes out two minutes later. The console says `scheduled in 120s` at the call and reports the HTTP result when it actually fires, so two messages per call is normal.
 - **`wait_mode: block` does stop the toolhead with a hot nozzle.** In that mode the wait holds the G-code stream, the move queue drains, and the printer sits still for the duration — a `wait_mode: block` with `wait_time: 120` mid-print will leave a blob or a burnt patch. That is why `defer` is the default. If you do want `block` mid-print, park and retract first; `docs/example-printer.cfg` has a macro that does.
 - **The delay is counted from when the line is parsed, not from when the toolhead gets there.** Klipper reads ahead of the motion queue, so a `LOXONE` call in the middle of a print starts its countdown slightly before the nozzle reaches the matching point in the model. For "switch the light on at layer 30" that is irrelevant; for anything that must be frame-accurate it is not.
