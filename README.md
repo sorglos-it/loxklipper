@@ -167,7 +167,30 @@ managed_services: klipper
 install_script: install.sh
 ```
 
-Restart Moonraker once after it appears, then loxklipper shows up alongside Klipper and Moonraker in Mainsail's or Fluidd's update panel.
+Restart Moonraker once after it appears, then loxklipper shows up alongside Klipper and Moonraker in Mainsail's or Fluidd's update panel. The installer restarts Moonraker for you when it added the block and can use `sudo` without a password.
+
+### It does not show up in Mainsail
+
+Work down this list — it is ordered by how often each one is the answer.
+
+1. **`install.sh` never ran on the printer.** Pushing the repository to GitHub changes nothing on the Pi. `git clone` it there and run the installer.
+2. **Moonraker has not restarted since the block was added.** Moonraker reads `moonraker.conf` only at startup, so a new entry stays invisible until then: `sudo systemctl restart moonraker`.
+3. **The folder is not a git clone.** A ZIP download has no `.git`, and Moonraker drops a `git_repo` entry without one — the module still works, the update entry never appears. Re-clone it. Current versions of `install.sh` warn about this.
+4. **`moonraker.conf` is somewhere the installer did not look.** It checks `~/printer_data/config`, `~/klipper_config` and `~/config`; anywhere else needs `KLIPPER_CONFIG=/path/to/config bash install.sh`.
+5. **`path:` no longer matches where the clone lives.** The installer writes the real path it found; moving the folder afterwards breaks the entry.
+6. **Moonraker rejected the entry and said why** — this is the one to check when the first five look fine:
+
+```bash
+grep -i loxklipper ~/printer_data/logs/moonraker.log | tail -20
+```
+
+A frequent culprit there is git's *dubious ownership* error, from cloning as root while Moonraker runs as `pi`. Fix it with `sudo chown -R pi:pi ~/loxklipper`.
+
+What Moonraker itself thinks it has, regardless of what the UI draws:
+
+```bash
+curl -s localhost:7125/machine/update/status | python3 -m json.tool | grep -i loxklipper
+```
 
 ## How it works
 

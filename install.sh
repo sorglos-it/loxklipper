@@ -32,6 +32,20 @@ fi
 
 [[ -f "${SRC}" ]] || die "${SRC} not found - is the repository complete?"
 
+# --- must be a git clone ---------------------------------------------------
+# Moonraker's update manager drives a "git_repo" entry with git itself. A ZIP
+# download has no .git, so Moonraker rejects the entry on startup and it never
+# shows up in Mainsail - with the module itself working fine, which makes it a
+# confusing failure. Catch it here instead.
+IS_GIT=1
+if ! git -C "${REPO_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
+    IS_GIT=0
+    warn "${REPO_DIR} is not a git clone (downloaded as ZIP?)."
+    warn "The module will work, but Moonraker cannot auto-update it and the"
+    warn "entry will not appear in Mainsail. To fix:"
+    warn "  rm -rf ${REPO_DIR} && git clone https://github.com/sorglos-it/loxklipper.git ${REPO_DIR}"
+fi
+
 # --- locate Klipper --------------------------------------------------------
 if [[ ! -d "${KLIPPER_PATH}/klippy/extras" ]]; then
     for candidate in "${HOME}/klipper" /usr/share/klipper /opt/klipper; do
@@ -87,30 +101,48 @@ if [[ -n "${KLIPPER_CONFIG}" && -f "${KLIPPER_CONFIG}/moonraker.conf" ]]; then
         } >> "${MOONRAKER_CONF}"
         ok "added [update_manager loxklipper] to ${MOONRAKER_CONF}"
         info "backup: ${MOONRAKER_CONF}.loxklipper.bak"
-        info "restart Moonraker to pick it up: sudo systemctl restart moonraker"
+        MOONRAKER_NEEDS_RESTART=1
     fi
 else
     warn "no moonraker.conf found - add the [update_manager loxklipper]"
     warn "block from the README by hand if you want auto-updates."
+    warn "Looked in: ${KLIPPER_CONFIG:-~/printer_data/config, ~/klipper_config, ~/config}"
+    warn "Set KLIPPER_CONFIG=/path/to/config and run this again if it lives elsewhere."
 fi
 
-# --- restart Klipper -------------------------------------------------------
-# Only with a terminal and passwordless sudo. Under Moonraker there is no
-# TTY, and 'managed_services: klipper' restarts Klipper anyway - prompting
-# for a password there would hang the update.
+# --- restart services ------------------------------------------------------
+# Only with a terminal and passwordless sudo. Under Moonraker there is no TTY,
+# and 'managed_services: klipper' restarts Klipper anyway - prompting for a
+# password there would hang the update.
+#
+# Moonraker only reads moonraker.conf at startup, so a freshly added
+# [update_manager] block stays invisible in Mainsail until it restarts. That
+# is the usual reason the entry "does not show up".
+CAN_SUDO=0
 if [[ ${RESTART} -eq 1 ]] && [[ -t 0 ]] && sudo -n true 2>/dev/null; then
-    if sudo -n systemctl restart klipper 2>/dev/null; then
-        ok "klipper restarted"
-    else
-        warn "could not restart klipper - do it yourself:"
-        warn "  sudo systemctl restart klipper"
+    CAN_SUDO=1
+fi
+
+restart_service() {  # $1 = service name
+    if [[ ${CAN_SUDO} -eq 1 ]] && sudo -n systemctl restart "$1" 2>/dev/null; then
+        ok "$1 restarted"
+        return 0
     fi
-else
-    info "restart Klipper to load the module:"
-    info "  sudo systemctl restart klipper"
+    warn "restart $1 yourself:  sudo systemctl restart $1"
+    return 1
+}
+
+restart_service klipper || true
+if [[ ${MOONRAKER_NEEDS_RESTART:-0} -eq 1 ]]; then
+    restart_service moonraker || true
 fi
 
 echo
 echo "Done. Add a [loxone ...] section to printer.cfg - see docs/example-printer.cfg"
 echo "Check it without the printer first:"
 echo "  python3 ${REPO_DIR}/tools/loxone_send.py ${KLIPPER_CONFIG:-~/printer_data/config}/printer.cfg <name>"
+if [[ ${IS_GIT} -eq 0 ]]; then
+    echo
+    echo "Reminder: this is not a git clone, so loxklipper will NOT appear in"
+    echo "Mainsail's update manager. Re-clone it to fix that."
+fi
