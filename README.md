@@ -20,6 +20,7 @@ Nothing about it is tied to the printer: it is a plain HTTP call to the Miniserv
 - **Temperature guard** — `nozzle: 60` holds the request back until the hotend has cooled below 60 °C; `bed:` does the same for the bed
 - **Delayed sending** — `wait_time` fires the request N seconds *after* the guard opens, by default without holding up the print; overridable per call with `WAIT=`
 - **Override per call** — `VALUE=` sends a different text through the same target, so on and off need one section, not two
+- **Inspect and cancel** — `LOXONE_LIST` shows every target with the exact URL it calls and what is queued, `LOXONE_CANCEL` drops calls that have not gone out yet
 - **Chooses how to fail** — `on_error: log` (default), `pause` the print, or `abort` it
 - **Retries** — `retries: N` re-sends after a network hiccup
 - **Test without the printer** — `tools/loxone_send.py` fires the same config section from a shell
@@ -129,31 +130,128 @@ wait_time: 0
 
 Option names are case-insensitive and the camelCase spellings above are accepted, because Klipper lower-cases every option name before a module sees it. `loxoneIP` and `loxone_ip` are the same option; pick one style and stay with it.
 
-[`docs/example-printer.cfg`](docs/example-printer.cfg) has a fuller set including macro examples.
+## Temperature guard
 
-## Commands
+`nozzle: 60` holds a call back until the hotend has cooled below 60 °C — useful when the thing being switched should not happen while the printer is still hot, for instance cutting power to the printer's socket or shutting down an enclosure fan.
 
-| Command | Effect |
-|---|---|
-| `LOXONE NAME=<target>` | Wait the target's `wait_time`, then send its configured text |
-| `LOXONE NAME=<target> VALUE=<text>` | Send a different text through the same target |
-| `LOXONE NAME=<target> WAIT=<seconds>` | Override `wait_time` for this call; `WAIT=0` sends at once |
-| `LOXONE_CANCEL [NAME=<target>]` | Drop scheduled calls that have not been sent yet |
-| `LOXONE_LIST` | List the configured targets with the URL each one would call |
+```ini
+[loxone printer_socket]
+loxone_ip: 192.168.1.10
+user: klipper
+password: changeme
+vi_name: api
+text_send: socket_off
+nozzle: 60          # only once the hotend is below 60 °C
+bed: 50             # and the bed below 50 °C
+wait_time: 30       # then wait another 30 s, then send
+```
 
-In a macro:
+The guard runs **before** `wait_time`, so the 30 s above start counting the moment the printer is cool enough, not when the G-code line was reached. Every configured limit has to be satisfied at once.
+
+Two properties worth knowing, both deliberate:
+
+- **The guard has no timeout.** If the printer never cools below the limit — because a next print reheats it — the call simply never goes out. For a safety guard that is the right failure direction. `LOXONE_LIST` shows what is still held, `LOXONE_CANCEL` clears it. In `wait_mode: block` the same situation holds the G-code stream indefinitely, exactly as Klipper's own `TEMPERATURE_WAIT` does.
+- **A stale sensor does not count as cold.** Klipper's `get_temp()` returns `0.0` when the last reading is more than about five seconds old, which for a guard is the dangerous direction — a hung sensor would look like a cold nozzle. The guard therefore requires three consecutive readings below the limit before it opens, so a single stale `0.0` cannot release it. Anything it cannot read at all (missing heater, exception) counts as too hot.
+
+A heater name that does not exist is a **startup error**, not a warning. The guard fails safe by never opening, and a silent never-switching call is far harder to notice than a printer that refuses to start.
+
+## G-code commands
+
+Three commands, registered once no matter how many `[loxone ...]` sections you have.
+
+### `LOXONE` — switch something
+
+```
+LOXONE NAME=<target> [VALUE=<text>] [WAIT=<seconds>]
+```
+
+| Parameter | Required | Meaning |
+|---|---|---|
+| `NAME` | yes | The section name, so `[loxone printer_light]` is `NAME=printer_light`. Case-insensitive |
+| `VALUE` | no | Send this text instead of the section's `text_send` — how one section covers both on and off |
+| `WAIT` | no | Override `wait_time` for this call, in seconds. `WAIT=0` skips the wait |
+
+`WAIT=0` skips the wait, **not the temperature guard**. A target with `nozzle: 60` still holds the call until the hotend is cool, whatever `WAIT` says — a guard that a G-code parameter could switch off would not be worth much.
+
+What it prints, depending on the target:
+
+```
+> LOXONE NAME=relay                       # wait_time: 0, no guard
+loxone relay: sw1 -> HTTP 200 OK
+
+> LOXONE NAME=printer_light               # wait_time: 120
+loxone printer_light: light_on scheduled in 120s
+
+> LOXONE NAME=printer_socket              # nozzle: 60, wait_time: 5
+loxone printer_socket: socket_off held back, waiting for extruder 250.0C >= 60C
+loxone printer_socket: temperature reached, socket_off sends in 5s
+loxone printer_socket: socket_off -> HTTP 200 OK
+```
+
+A delayed call reports twice: once when it is accepted, once when it actually goes out. A failure is prefixed with `!!` and also lands in `klippy.log`.
+
+### `LOXONE_LIST` — what is configured, what is queued
+
+```
+> LOXONE_LIST
+Configured Loxone targets:
+  printer_light: POST http://192.168.1.10/dev/sps/io/api/light_on [wait 120s; defer]
+  printer_socket: POST http://192.168.1.10/dev/sps/io/api/socket_off [guard extruder<60C; wait 120s; defer; 1 pending, 1 held by guard]
+  relay: POST http://192.168.1.10/dev/sps/io/api/sw1 [sends at once]
+```
+
+The URL shown is exactly the one the target would call, which makes this the fastest way to find a typo in `vi_name` or `text_send`. Passwords are never printed.
+
+### `LOXONE_CANCEL` — drop what has not been sent
+
+```
+LOXONE_CANCEL [NAME=<target>]
+```
+
+Without `NAME` it clears every target, otherwise just that one. It drops both calls still held by the temperature guard and calls already counting down their `wait_time`. A request that is already on the wire is not recalled.
+
+```
+> LOXONE_CANCEL
+loxone: cancelled 1 scheduled call(s)
+```
+
+## Macros
 
 ```ini
 [gcode_macro PRINT_START]
 gcode:
+    # Anything the previous print left scheduled - above all a socket_off
+    # still counting down - must not fire into this print.
+    LOXONE_CANCEL
     LOXONE NAME=printer_light
     LOXONE NAME=workshop_fan
+    # ... homing, heating, your usual start ...
 
 [gcode_macro PRINT_END]
 gcode:
+    # ... retract, park ...
+    TURN_OFF_HEATERS
     LOXONE NAME=workshop_fan VALUE=WS-FAN-OFF
     LOXONE NAME=printer_light VALUE=light_off
+    # held back until the printer has cooled below its nozzle: limit
+    LOXONE NAME=printer_socket
+
+[gcode_macro CANCEL_PRINT]
+rename_existing: CANCEL_PRINT_BASE
+gcode:
+    LOXONE_CANCEL
+    CANCEL_PRINT_BASE
 ```
+
+A one-off delay without touching the config, useful in start G-code — *switch the light on once the first layer is down*:
+
+```ini
+[gcode_macro LIGHT_ON_LATER]
+gcode:
+    LOXONE NAME=printer_light WAIT=180
+```
+
+[`docs/example-printer.cfg`](docs/example-printer.cfg) has all of this as a working file.
 
 ## Testing without the printer
 
@@ -215,31 +313,6 @@ When `LOXONE` runs with no wait, the target percent-encodes `vi_name` and the te
 With a `wait_time` in the default `defer` mode the command returns straight away and the send is put on a Klipper reactor timer. Two long-lived timers per target drive it — one to fire due calls, one to collect finished requests — re-armed with `update_timer` rather than registered per call, so a print with hundreds of `LOXONE` calls does not leave hundreds of dead timers behind. `wait_mode: block` instead holds the G-code stream in a `reactor.pause()` loop, in one-second slices, breaking out if the printer shuts down underneath it.
 
 Failures land in `_handle_failure`, which logs to `klippy.log`, echoes to the console with a `!!` prefix, and then does whatever `on_error` says.
-
-## Temperature guard
-
-`nozzle: 60` holds a call back until the hotend has cooled below 60 °C — useful when the thing being switched should not happen while the printer is still hot, for instance cutting power to the printer's socket or shutting down an enclosure fan.
-
-```ini
-[loxone printer_socket]
-loxone_ip: 192.168.1.10
-user: klipper
-password: changeme
-vi_name: api
-text_send: socket_off
-nozzle: 60          # only once the hotend is below 60 °C
-bed: 50             # and the bed below 50 °C
-wait_time: 30       # then wait another 30 s, then send
-```
-
-The guard runs **before** `wait_time`, so the 30 s above start counting the moment the printer is cool enough, not when the G-code line was reached. Every configured limit has to be satisfied at once.
-
-Two properties worth knowing, both deliberate:
-
-- **The guard has no timeout.** If the printer never cools below the limit — because a next print reheats it — the call simply never goes out. For a safety guard that is the right failure direction. `LOXONE_LIST` shows what is still held, `LOXONE_CANCEL` clears it. In `wait_mode: block` the same situation holds the G-code stream indefinitely, exactly as Klipper's own `TEMPERATURE_WAIT` does.
-- **A stale sensor does not count as cold.** Klipper's `get_temp()` returns `0.0` when the last reading is more than about five seconds old, which for a guard is the dangerous direction — a hung sensor would look like a cold nozzle. The guard therefore requires three consecutive readings below the limit before it opens, so a single stale `0.0` cannot release it. Anything it cannot read at all (missing heater, exception) counts as too hot.
-
-A heater name that does not exist is a **startup error**, not a warning. The guard fails safe by never opening, and a silent never-switching call is far harder to notice than a printer that refuses to start.
 
 ## Notes & caveats
 
