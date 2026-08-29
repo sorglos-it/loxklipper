@@ -34,16 +34,16 @@ Nothing about it is tied to the printer: it is a plain HTTP call to the Miniserv
 
 ## Setting up the Loxone side
 
-The endpoint this module uses pushes a **text** into the Miniserver, so it needs a **Virtueller Texteingang** (Virtual Text Input). A plain virtual input will not do — that one takes a numeric value and the URL below would not reach it.
+The endpoint this module uses pushes a **text** into the Miniserver, so it needs a **Virtual Text Input**. A plain virtual input will not do — that one takes a numeric value and the URL below would not reach it.
 
-![Loxone Config: virtual text input, Impuls bei, Schalter, relay](docs/loxone-config-example.jpg)
+![Loxone Config: virtual text input into a Pulse At block, driving a switch and a relay](docs/loxone-config-example.jpg)
 
-A ready-made project with exactly this wiring is in [`docs/example.Loxone`](docs/example.Loxone) — open it in Loxone Config to look around.
+A ready-made project with exactly this wiring is in [`docs/example.Loxone`](docs/example.Loxone) — open it in Loxone Config to look around. The screenshot above is a German Loxone Config, so the German labels are given below alongside the English ones.
 
-1. In **Loxone Config**, go to **Peripherie → Virtuelle Eingänge** and create a **Virtueller Texteingang**. In the example it is called **`api`**.
+1. In **Loxone Config**, go to **Periphery → Virtual Inputs** (*Peripherie → Virtuelle Eingänge*) and create a **Virtual Text Input** (*Virtueller Texteingang*). In the example it is called **`api`**.
 2. That name is what goes into **`vi_name`**, character for character — it becomes part of the URL. Keep it short and free of spaces and umlauts and you never have to think about percent-encoding.
-3. Drag in an **Impuls bei** block and connect the text input's **VI** output to its **T** input. Set the block's text to the value you intend to send — **`sw1`** in the example. That value is what goes into **`text_send`**. The block emits a pulse on **P** whenever the arriving text matches it.
-4. Wire **P** into whatever you want to trigger. The example feeds the **Tg** (toggle) input of a **Schalter**, whose output drives relay **Q1**.
+3. Drag in a **Pulse At** block (*Impuls bei*) and connect the text input's **VI** output to its **T** input. Set the block's text to the value you intend to send — **`sw1`** in the example. That value is what goes into **`text_send`**. The block emits a pulse on **P** whenever the arriving text matches it.
+4. Wire **P** into whatever you want to trigger. The example feeds the **Tg** (toggle) input of a **Switch** (*Schalter*), whose output drives relay **Q1**.
 5. Save the program to the Miniserver.
 
 The resulting request is
@@ -57,8 +57,8 @@ so the example project answers to `http://192.168.1.10/dev/sps/io/api/sw1`, whic
 
 Two things about this wiring are worth knowing before you copy it:
 
-- **`Tg` is a toggle, so sending `sw1` twice switches on and then off again.** Convenient for a test, awkward for a print — if a print aborts between the two calls, the relay stays on. For a deterministic on and off, use two texts (`sw1_on`, `sw1_off`), give each its own **Impuls bei** block, and wire them into the Schalter's **On** and **Off** inputs instead of **Tg**. One `[loxone ...]` section still covers both, because `VALUE=` overrides the text per call.
-- **One text input can drive any number of these.** Hang several **Impuls bei** blocks off the same **VI** output, each matching a different text, and one `[loxone ...]` section plus `VALUE=` reaches all of them.
+- **`Tg` is a toggle, so sending `sw1` twice switches on and then off again.** Convenient for a test, awkward for a print — if a print aborts between the two calls, the relay stays on. For a deterministic on and off, use two texts (`sw1_on`, `sw1_off`), give each its own **Pulse At** block, and wire them into the switch's **On** and **Off** inputs instead of **Tg**. One `[loxone ...]` section still covers both, because `VALUE=` overrides the text per call.
+- **One text input can drive any number of these.** Hang several **Pulse At** blocks off the same **VI** output, each matching a different text, and one `[loxone ...]` section plus `VALUE=` reaches all of them.
 
 ## Installation
 
@@ -95,7 +95,7 @@ loxone_ip: 192.168.1.10
 user: klipper
 password: changeme
 vi_name: api            # name of the Virtual Text Input
-text_send: sw1          # text the "Impuls bei" block matches
+text_send: sw1          # text the "Pulse At" block matches
 wait_time: 0
 ```
 
@@ -105,7 +105,7 @@ wait_time: 0
 | `user` | *required* | Loxone user allowed to use the web service. Alias: `username` |
 | `password` | *required* | That user's password, in plain text — read the caveats. Alias: `passwort` |
 | `vi_name` | *required* | Name of the Virtual Text Input in Loxone Config. Alias: `viName` |
-| `text_send` | *required* | Text pushed into that input; must match what the **Impuls bei** block behind it expects. Alias: `textSend` |
+| `text_send` | *required* | Text pushed into that input; must match what the **Pulse At** block behind it expects. Alias: `textSend` |
 | `wait_time` | `0` | Seconds to hold the G-code stream **after** the call. Alias: `waittime` |
 | `protocol` | `http` | `http` or `https` |
 | `verify_certificate` | `True` | HTTPS only. `False` skips certificate checking for a self-signed Miniserver certificate |
@@ -186,7 +186,7 @@ Failures land in `_handle_failure`, which logs to `klippy.log`, echoes to the co
 - **POST is the default because it was asked for; Loxone documents these endpoints as GET.** POST works against current firmware. If your Miniserver answers `405 Method Not Allowed`, set `method: GET` — nothing else changes.
 - **`on_error: log` means a dead Miniserver does not stop your print.** That is the default on purpose. If the switching matters more than the print, use `abort`; `pause` needs `[pause_resume]` configured, and says so in the console instead of failing silently if it is missing.
 - **`verify_certificate: False` turns off TLS verification completely** for that target — not just the hostname check. It is the right setting for a Miniserver with a self-signed certificate on your own LAN and the wrong one over the open internet.
-- **A wrong text is not an error.** The Miniserver accepts any text into the input and answers `200`; only the **Impuls bei** block decides whether anything happens. So a typo in `text_send` looks like a success in the Klipper console and switches nothing. `LOXONE_LIST` prints the exact URL each target calls — compare it against the block in Loxone Config.
+- **A wrong text is not an error.** The Miniserver accepts any text into the input and answers `200`; only the **Pulse At** block decides whether anything happens. So a typo in `text_send` looks like a success in the Klipper console and switches nothing. `LOXONE_LIST` prints the exact URL each target calls — compare it against the block in Loxone Config.
 - **Spaces and umlauts in `vi_name` or `text_send` are percent-encoded, `/` is not.** A slash is left alone so you can address deeper paths on purpose. If a name genuinely contains a slash, this module will not encode it for you.
 - **Klipper's Python environment has no `requests`.** Only what ships with Python is available, so this uses `urllib.request`: no connection pooling, no HTTP/2, one fresh connection per call. At the rate G-code fires these, that costs nothing.
 - **The symlink shows up as an untracked file in Klipper's git repository.** Every Klipper plugin installed this way does this. It does not block Klipper updates, but `git status` in `~/klipper` will mention `klippy/extras/loxone.py`.
