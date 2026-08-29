@@ -1,0 +1,16 @@
+# loxklipper is deployed onto a Linux printer host - every text file must
+# stay LF, even in a Windows working copy. Without this, install.sh fails on
+# the target with "/bin/bash^M: bad interpreter" and Klipper refuses the
+# module.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.cfg  text eol=lf
+*.conf text eol=lf
+*.md   text eol=lf
+LICENSE text eol=lf
+
+# Loxone Config exports - keep them byte-for-byte as Loxone wrote them
+*.xml   -text
+*.Loxone binary

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# tooling artefacts that land in the working copy
+receipts/
+review-receipts/
+
+*.bak
+*.log
+.DS_Store
+*.swp
+*~
