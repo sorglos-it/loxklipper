@@ -281,6 +281,18 @@ install_script: install.sh
 
 Restart Moonraker once after it appears, then loxklipper shows up alongside Klipper and Moonraker in Mainsail's or Fluidd's update panel. The installer restarts Moonraker for you when it added the block and can use `sudo` without a password.
 
+### Updating
+
+Use the update panel — **Mainsail → Settings → Update Manager → Update** next to loxklipper. That is the whole point of the block above, and it does three things in the right order: pull, re-run `install.sh`, restart Klipper.
+
+The manual equivalent is only a fallback:
+
+```bash
+cd ~/loxklipper && git pull && bash install.sh
+```
+
+It is worth knowing when you need it: before the update block exists, when Moonraker refuses the repo (see below), or when you are on a branch other than `main`. Note that it runs `install.sh` too — a bare `git pull` plus a Klipper restart happens to work today, because the only thing the installer does for an existing install is refresh a symlink that is already there, but that is a coincidence of the current version rather than something to rely on.
+
 ### It does not show up in Mainsail
 
 Work down this list — it is ordered by how often each one is the answer.
