@@ -57,6 +57,11 @@ Authorization: Basic <base64 of user:password>
 
 so the example project answers to `http://192.168.1.10/dev/sps/io/api/sw1`, which in `printer.cfg` is `vi_name: api` and `text_send: sw1`.
 
+Two things about this wiring are worth knowing before you copy it:
+
+- **`Tg` is a toggle, so sending `sw1` twice switches on and then off again.** Convenient for a test, awkward for a print — if a print aborts between the two calls, the relay stays on. For a deterministic on and off, use two texts (`sw1_on`, `sw1_off`), give each its own **Pulse At** block, and wire them into the switch's **On** and **Off** inputs instead of **Tg**. One `[loxone ...]` section still covers both, because `VALUE=` overrides the text per call.
+- **One text input can drive any number of these.** Hang several **Pulse At** blocks off the same **VI** output, each matching a different text, and one `[loxone ...]` section plus `VALUE=` reaches all of them.
+
 ## Order of a call
 
 ```
@@ -65,11 +70,6 @@ LOXONE NAME=…  →  temperature guard  →  wait_time  →  HTTP POST
 ```
 
 Both stages are optional. With neither configured the request goes out immediately and the console reports the result straight away.
-
-Two things about this wiring are worth knowing before you copy it:
-
-- **`Tg` is a toggle, so sending `sw1` twice switches on and then off again.** Convenient for a test, awkward for a print — if a print aborts between the two calls, the relay stays on. For a deterministic on and off, use two texts (`sw1_on`, `sw1_off`), give each its own **Pulse At** block, and wire them into the switch's **On** and **Off** inputs instead of **Tg**. One `[loxone ...]` section still covers both, because `VALUE=` overrides the text per call.
-- **One text input can drive any number of these.** Hang several **Pulse At** blocks off the same **VI** output, each matching a different text, and one `[loxone ...]` section plus `VALUE=` reaches all of them.
 
 ## Installation
 
